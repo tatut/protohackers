@@ -28,12 +28,12 @@ bool is_prime(double v) {
 }
 
 
-void prime_time(int socket, void *_data) {
+void prime_time(conn_state *c) {
   char *buf = malloc(65536);
   while(1) {
     // read until newline
-    if(!read_until(socket, buf, '\n', 65536)) {
-      err("failed to read line, closing socket %d", socket);
+    if(!read_until(c->socket, buf, '\n', 65536)) {
+      err("failed to read line, closing socket %d", c->socket);
       goto done;
     }
     char method[64] = {0};
@@ -43,10 +43,10 @@ void prime_time(int socket, void *_data) {
       size_t len = snprintf(response, 128,
                             "{\"method\":\"isPrime\",\"prime\":%s}\n",
                             is_prime(number) ? "true" : "false");
-      write(socket, response, len);
+      write(c->socket, response, len);
     } else {
       // malformed response
-      write(socket, "FAIL\n", 5);
+      write(c->socket, "FAIL\n", 5);
       break;
     }
   }

@@ -1,12 +1,12 @@
 #define SERVER_IMPLEMENTATION
 #include "server.h"
 
-void echo(int socket, void *data) {
+void echo(conn_state *c) {
   char buf[512];
   int r;
-  printf("got socket: %d\n", socket);
-  while((r = read(socket, buf, 512)) > 0) {
-    write(socket, buf, r);
+  printf("got socket: %d\n", c->socket);
+  while((r = read(c->socket, buf, 512)) > 0) {
+    write(c->socket, buf, r);
   }
 }
 

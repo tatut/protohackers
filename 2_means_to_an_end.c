@@ -11,7 +11,7 @@ int compare_by_ts(const void *a, const void *b) {
   return ((price*)a)->ts - ((price*)b)->ts;
 }
 
-void means_to_an_end(int socket, void *_data) {
+void means_to_an_end(conn_state *c) {
   uint8_t msg[9];
   int r;
   price *p;
@@ -23,9 +23,9 @@ void means_to_an_end(int socket, void *_data) {
   bool sorted=true;
 
   while(1) {
-    if((r = recv(socket, msg, 9, MSG_WAITALL)) < 9) {
+    if((r = recv(c->socket, msg, 9, MSG_WAITALL)) < 9) {
       for(int i=0;i<r;i++) printf(" read byte: %d (%c)\n", msg[i], msg[i]);
-      err("read %d, closing socket %d", r, socket);
+      err("read %d, closing socket %d", r, c->socket);
       break;
     }
     switch(msg[0]) {
@@ -49,7 +49,7 @@ void means_to_an_end(int socket, void *_data) {
       int32_t min_ts = ntohl(*((int32_t*)&msg[1]));
       int32_t max_ts = ntohl(*((int32_t*)&msg[5]));
       int64_t total = 0;
-      int32_t c = 0;
+      int32_t cnt = 0;
       price *at = p;
       if(!sorted) {
         qsort(prices, count, sizeof(price), compare_by_ts);
@@ -60,12 +60,12 @@ void means_to_an_end(int socket, void *_data) {
       while(i < count && prices[i].ts < min_ts) i++;
       while(i < count && prices[i].ts <= max_ts) {
         total += prices[i++].price;
-        c++;
+        cnt++;
       }
       dbg("Query: min_ts=%d,max_ts=%d => total=%lld,count=%d,average=%d",
-          min_ts, max_ts, total, c, (int32_t) (total/c));
-      int32_t avg = htonl(total/c);
-      write(socket, &avg, 4);
+          min_ts, max_ts, total, cnt, (int32_t) (total/cnt));
+      int32_t avg = htonl(total/cnt);
+      write(c->socket, &avg, 4);
       break;
     }
     default:

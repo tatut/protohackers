@@ -15,11 +15,28 @@
 #include <sys/stat.h>
 #include <stdatomic.h>
 
+/* thread workers = N worker threads are spawned which handle connections as they come
+ * select = single server thread that uses select() to handle multiple clients
+ *
+ * in select mode, each socket has associated state (alloc'ed by server)
+ * that is passed in every time the handler is invoked for the socket.
+ */
+typedef enum { SERVER_THREAD_WORKERS=0, SERVER_SELECT=1 } server_type;
+
+typedef struct conn_state {
+  int socket; // if 0, this is a free slot
+  void* data;
+
+  // internal, for broadcast
+  struct conn_state *_conns;
+} conn_state;
+
 typedef struct server_worker_args {
   int server_socket;
   void *data;
-  void (*handler)(int,void*);
+  void (*handler)(conn_state*);
 } server_worker_args;
+
 
 typedef struct server {
   uint16_t port;
@@ -27,9 +44,16 @@ typedef struct server {
   int backlog;
   pthread_t *workers;
   atomic_bool shutdown;
-  void (*handler)(int,void*);
+  void (*handler)(conn_state*);
   void *data;
+  server_type type;
+  size_t connection_data_size;
+
+  conn_state *conns;
+
 } server;
+
+
 
 #define serve(...) _serve((server) { __VA_ARGS__ })
 void _serve(server s);
@@ -56,7 +80,8 @@ void _server_worker(server_worker_args *args) {
       sleep(1);
       continue;
     }
-    args->handler(client_socket, args->data);
+    conn_state cs = {.socket = client_socket, .data = args->data };
+    args->handler(&cs);
     close(client_socket);
   }
 }
@@ -93,22 +118,80 @@ void _serve(server s) {
     fprintf(stderr, "Listen failed\n");
     return;
   }
-  // Start workers
-  s.shutdown = ATOMIC_VAR_INIT(false);
-  s.workers = alloca(sizeof(pthread_t)*s.threads);
-  server_worker_args args = {
-    .handler = s.handler,
-    .data = s.data,
-    .server_socket = server_fd};
-  for(int i=0; i<s.threads;i++) {
-    pthread_create(&s.workers[i], NULL, (void*) _server_worker, &args);
-  }
 
-  // Wait for workers to be done
-  for(int i=0; i < s.threads; i++) {
-    pthread_join(s.workers[i], NULL);
-  }
+  if(s.type == SERVER_THREAD_WORKERS) {
+    // Start workers
+    s.shutdown = ATOMIC_VAR_INIT(false);
+    s.workers = alloca(sizeof(pthread_t)*s.threads);
+    server_worker_args args = {
+      .handler = s.handler,
+      .data = s.data,
+      .server_socket = server_fd};
+    for(int i=0; i<s.threads;i++) {
+      pthread_create(&s.workers[i], NULL, (void*) _server_worker, &args);
+    }
 
+    // Wait for workers to be done
+    for(int i=0; i < s.threads; i++) {
+      pthread_join(s.workers[i], NULL);
+    }
+  } else {
+    // Single threaded select server
+    dbg("select seerver!");
+    fd_set ready;
+    #define MAX_CONNS 64
+    conn_state conns[MAX_CONNS] = {0}; // PENDING: do we need more?
+    struct sockaddr_in client_addr;
+    int addr_len = sizeof(client_addr);
+
+    while(1) {
+      FD_ZERO(&ready);
+      FD_SET(server_fd, &ready);
+      int max_fd = server_fd;
+      for(int i=0;i<MAX_CONNS;i++) {
+        if(conns[i].socket > 0) {
+          FD_SET(conns[i].socket, &ready);
+          max_fd = conns[i].socket > max_fd ? conns[i].socket : max_fd;
+        }
+      }
+      const int activity = select(max_fd+1, &ready, NULL, NULL, NULL);
+      if(activity < 0 && errno != EINTR) {
+        perror("Select error");
+      }
+
+      // handle new connection
+      if(FD_ISSET(server_fd, &ready)) {
+        // find empty slot
+        int i=0;
+        while(i < MAX_CONNS && conns[i].socket > 0) i++;
+        if(i==MAX_CONNS) {
+          err("Too many connections!");
+        } else {
+          conns[i].socket = accept(server_fd, (struct sockaddr *)&client_addr, (socklen_t*)&addr_len);
+          dbg("got connection %d", conns[i].socket);
+          if(s.connection_data_size) {
+            if(conns[i].data) {
+              // already allocated, zero it out
+              dbg("zeroing old state");
+              memset(conns[i].data, 0, s.connection_data_size);
+            } else {
+              dbg("new state");
+              conns[i].data = calloc(1, s.connection_data_size);
+            }
+          }
+          conns[i]._conns = conns;
+          s.handler(&conns[i]);
+        }
+      }
+      dbg("checking conns!");
+      // check any connections for activity
+      for(int i=0;i<MAX_CONNS;i++) {
+        if(conns[i].socket > 0 && FD_ISSET(conns[i].socket, &ready)) {
+          s.handler(&conns[i]);
+        }
+      }
+    }
+  }
 }
 
 int readch(int socket) {
@@ -129,5 +212,17 @@ bool read_until(int socket, char *to, char endch, size_t maxlen) {
   }
   return false; // unreachable
 }
+
+#define each_conn_data(c, conn, type, item, body)                              \
+  conn_state *__each_conns = (c)->_conns;                                      \
+  for (int __each_i = 0; __each_i < MAX_CONNS; __each_i++) {                   \
+    if (__each_conns[__each_i].socket != 0 &&                                  \
+        __each_conns[__each_i].socket != (c)->socket) {                        \
+      conn_state *conn = &__each_conns[__each_i];                              \
+      type item = (type)__each_conns[__each_i].data;                           \
+      body                                                                     \
+    }                                                                          \
+  }
+
 
 #endif
