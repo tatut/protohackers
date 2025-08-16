@@ -1,2 +1,2 @@
 CompileFlags:
-  Add: ["-DSERVER_IMPLEMENTATION"]
+  Add: ["-DSERVER_IMPLEMENTATION", "-std=gnu11"]

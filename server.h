@@ -34,6 +34,13 @@ typedef struct server {
 #define serve(...) _serve((server) { __VA_ARGS__ })
 void _serve(server s);
 
+int readch(int socket);
+bool read_until(int socket, char *to, char endch, size_t maxlen);
+
+#define VA_ARGS(...) , ##__VA_ARGS__
+#define err(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n" VA_ARGS(__VA_ARGS__))
+#define dbg(fmt, ...) fprintf(stdout, "[DEBUG] " fmt "\n" VA_ARGS(__VA_ARGS__))
+
 #endif
 
 #ifdef SERVER_IMPLEMENTATION
@@ -55,8 +62,10 @@ void _server_worker(server_worker_args *args) {
 }
 
 void _serve(server s) {
-  if(s.threads == 0) s.threads = 4;
+  if(s.threads == 0) s.threads = 10;
   if(s.backlog == 0) s.backlog = 10;
+  if(s.port == 0) s.port = 8088;
+
   struct sockaddr_in server_addr;
   const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if(!server_fd) {
@@ -100,6 +109,25 @@ void _serve(server s) {
     pthread_join(s.workers[i], NULL);
   }
 
+}
+
+int readch(int socket) {
+  char ch;
+  if(read(socket, &ch, 1) != 1) return -1;
+  return ch;
+}
+
+bool read_until(int socket, char *to, char endch, size_t maxlen) {
+  char ch;
+  while(1) {
+    if(maxlen == 0) return false;
+    ch = readch(socket);
+    if(ch == -1) return false;
+    if(ch == endch) { *to = 0; return true; }
+    *to++ = ch;
+    maxlen--;
+  }
+  return false; // unreachable
 }
 
 #endif
