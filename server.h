@@ -17,11 +17,21 @@
 
 /* thread workers = N worker threads are spawned which handle connections as they come
  * select = single server thread that uses select() to handle multiple clients
+ * dgram = listen to UDP packets, invoke handler for each
  *
  * in select mode, each socket has associated state (alloc'ed by server)
  * that is passed in every time the handler is invoked for the socket.
+ *
+ * in dgram mode, the dgram_handler is used with a struct dgram param
  */
-typedef enum { SERVER_THREAD_WORKERS=0, SERVER_SELECT=1 } server_type;
+typedef enum { SERVER_THREAD_WORKERS=0, SERVER_SELECT=1, SERVER_DGRAM } server_type;
+
+typedef struct dgram {
+  int socket;
+  uint8_t *data; // raw byte data (not nul terminated)
+  uint16_t len; // length
+  struct sockaddr_in *from;
+} dgram;
 
 typedef struct conn_state {
   int socket; // if 0, this is a free slot
@@ -45,6 +55,7 @@ typedef struct server {
   pthread_t *workers;
   atomic_bool shutdown;
   void (*handler)(conn_state*);
+  void (*dgram_handler)(dgram*);
   void *data;
   server_type type;
   size_t connection_data_size;
@@ -92,7 +103,8 @@ void _serve(server s) {
   if(s.port == 0) s.port = 8088;
 
   struct sockaddr_in server_addr;
-  const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  const int server_fd =
+    socket(AF_INET, s.type == SERVER_DGRAM ? SOCK_DGRAM : SOCK_STREAM, 0);
   if(!server_fd) {
     fprintf(stderr, "Failed to create server socket.\n");
     return;
@@ -114,9 +126,11 @@ void _serve(server s) {
   }
 
   // Listen for connections
-  if (listen(server_fd, s.backlog) < 0) {
-    fprintf(stderr, "Listen failed\n");
-    return;
+  if(s.type != SERVER_DGRAM) {
+    if (listen(server_fd, s.backlog) < 0) {
+      perror("Listen failed");
+      return;
+    }
   }
 
   if(s.type == SERVER_THREAD_WORKERS) {
@@ -135,9 +149,8 @@ void _serve(server s) {
     for(int i=0; i < s.threads; i++) {
       pthread_join(s.workers[i], NULL);
     }
-  } else {
+  } else if(s.type == SERVER_SELECT) {
     // Single threaded select server
-    dbg("select seerver!");
     fd_set ready;
     #define MAX_CONNS 64
     conn_state conns[MAX_CONNS] = {0}; // PENDING: do we need more?
@@ -191,7 +204,27 @@ void _serve(server s) {
         }
       }
     }
+  } else if(s.type == SERVER_DGRAM) {
+    while(1) {
+
+      uint8_t buf[1024];
+      struct sockaddr_in client_addr;
+      socklen_t addr_len = sizeof(client_addr);
+      int r = recvfrom(server_fd, buf, 1024, 0, (struct sockaddr *)&client_addr, &addr_len);
+      if(r < 0) {
+        err("UDP receive failed");
+      }
+      buf[r] = 0; // nul terminate
+      dgram d = {.socket = server_fd, .data = buf, .len = r, .from = &client_addr};
+      s.dgram_handler(&d);
+
+    }
+
+  } else {
+    err("Unknown server type");
+    exit(1);
   }
+
 }
 
 int readch(int socket) {
