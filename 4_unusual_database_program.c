@@ -1,18 +1,8 @@
 #include <stdint.h>
 #define SERVER_IMPLEMENTATION
 #include "server.h"
-
-// modified djb2 hash: http://www.cse.yorku.ca/~oz/hash.html
-unsigned long hash(uint8_t *data, size_t len) {
-  unsigned long hash = 5381;
-  int c;
-
-  for(size_t i=0;i<len;i++) {
-    c = *data++;
-    hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
-  }
-  return hash;
-}
+#define HASH_IMPLEMENTATION
+#include "hash.h"
 
 #define HT_SIZE 4096
 

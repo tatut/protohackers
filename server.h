@@ -91,9 +91,13 @@ void _server_worker(server_worker_args *args) {
       sleep(1);
       continue;
     }
+    //dbg("WORKER GOT CLIENT %d" , client_socket);
     conn_state cs = {.socket = client_socket, .data = args->data };
+    //dbg("CALLING HANDLER");
     args->handler(&cs);
+    //dbg("HANDLER DONE");
     close(client_socket);
+    //dbg("CONN DONE");
   }
 }
 
@@ -144,11 +148,11 @@ void _serve(server s) {
     for(int i=0; i<s.threads;i++) {
       pthread_create(&s.workers[i], NULL, (void*) _server_worker, &args);
     }
-
     // Wait for workers to be done
     for(int i=0; i < s.threads; i++) {
       pthread_join(s.workers[i], NULL);
     }
+    dbg("ALL THREADS DONE");
   } else if(s.type == SERVER_SELECT) {
     // Single threaded select server
     fd_set ready;
