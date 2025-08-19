@@ -6,11 +6,9 @@
 #define ARENA_IMPLEMENTATION
 #define error err
 #include "arena.h"
-#define HASH_IMPLEMENTATION
-#include "hash.h"
-#define DYNARR_IMPLEMENTATION
-#define panic(...) { err(__VA_ARGS__); exit(1); }
-#include "dynarr.h"
+
+#define STB_DS_IMPLEMENTATION
+#include "stb/stb_ds.h"
 
 #include <sys/time.h>
 #include <sys/ioctl.h>
@@ -98,33 +96,55 @@ typedef struct CarPos {
   u16 road, mile, limit;
 } CarPos;
 
-DefineArray(CarPosArray, CarPos);
+typedef struct DayTicket {
+  uint32_t key; // the day floot(ts/86400)
+  bool value;
+} DayTicket;
 
 typedef struct Car {
-  char *plate;
-  CarPosArray observations;
+  CarPos *observations;
+  DayTicket *tickets;
 } Car;
 
-// Global state
-#define HT_SIZE 4096
+typedef struct CarMap {
+  char *key;
+  Car value;
+} CarMap;
 
-DefineArray(CarArray, Car);
-DefineArray(DispatcherArray, Dispatcher);
+typedef struct Ticket {
+  char *plate;
+  u16 road;
+  u16 mile1;
+  u32 ts1;
+  u16 mile2;
+  u32 ts2;
+  u16 speed;
+} Ticket;
 
 
 typedef struct SpeedDaemon {
   arena a;
   pthread_mutex_t lock; // mutation lock
-  CarArray bucket[HT_SIZE]; // hash buckets for cars
-  DispatcherArray dispatchers;
+  CarMap *car_table; // hashtable of cars (plate -> car)
+  Dispatcher *dispatchers;
+  Ticket *tickets; // pending tickets to send
 } SpeedDaemon;
 
 SpeedDaemon state = {0};
 
+void lock(pthread_mutex_t *l) {
+  int c = 0;
+  while(pthread_mutex_trylock(l) != 0) {
+    usleep(100000);
+    c++;
+    if(c % 10 == 0)
+      dbg("Thread waiting on lock for %f seconds", c/10.0);
+  }
+}
 
 #define defer(name,start,end) for(int __##name = (start,0); !__##name; (__##name += 1), end)
 #define locking(state)                                                       \
-  defer(mutex, pthread_mutex_lock(&(state)->lock), pthread_mutex_unlock(&(state)->lock))
+  defer(mutex, lock(&(state)->lock), pthread_mutex_unlock(&(state)->lock))
 
 // functions operating on state
 
@@ -133,7 +153,7 @@ void init_state(SpeedDaemon *state) { pthread_mutex_init(&state->lock, NULL); }
 // sort by mile and road
 int compare_road_and_ts(const void *a, const void *b) {
   CarPos *ca = (CarPos*) a, *cb = (CarPos*) b;
-  dbg("compare (r: %d, ts: %d) with (r: %d, ts: %d)", ca->road, ca->ts, cb->road, cb->ts);
+  //dbg("compare (r: %d, ts: %d) with (r: %d, ts: %d)", ca->road, ca->ts, cb->road, cb->ts);
   int rd = ca->road - cb->road;
   if(rd == 0) {
     return ca->ts - cb->ts;
@@ -142,88 +162,115 @@ int compare_road_and_ts(const void *a, const void *b) {
   }
 }
 
-void send_ticket(SpeedDaemon *state, char *plate, uint16_t road,
-                 uint16_t mile1, uint32_t ts1,
-                 uint16_t mile2, uint32_t ts2,
-                 uint16_t speed) {
-  Dispatcher to;
-  bool found=false;
-  da_foreach(Dispatcher, disp, &state->dispatchers, {
-      for(int i=0;i<disp.numroads;i++) {
-        if(disp.roads[i] == road) {
-          dbg("Sending to dispatcher %d (socket %d, road %d)", i, disp.socket, road);
-          to = disp;
-          found = true;
-          break;
-        }
-      }
-    });
-  if(found) {
-    int len = strlen(plate);
-    char head[2] = { 0x21, len };
-    write(to.socket, &head, 2);
-    write(to.socket, plate, len);
-    uint16_t out = htons(road);
-    write(to.socket, &out, 2);
-    out = htons(mile1);
-    write(to.socket, &out, 2);
-    uint32_t out32 = htonl(ts1);
-    write(to.socket, &out32, 4);
-    out = htons(mile2);
-    write(to.socket, &out, 2);
-    out32 = htonl(ts2);
-    write(to.socket, &out32, 4);
-    out = htons(speed*100);
-    write(to.socket, &out, 2);
-  }
 
+
+void maybe_send_ticket(SpeedDaemon *state, Car *car, char *plate, CarPos a, CarPos b) {
+  long speed = round(fabs(3600.0 * (b.mile-a.mile) / (b.ts-a.ts)));
+  dbg("CHECK %s,  r: %d, m1: %d, ts1: %d,    m2: %d, ts2: %d,   speed %ld, limit %d", plate, a.road,
+      a.mile, a.ts, b.mile, b.ts,
+      speed, b.limit);
+  uint32_t day1 = floor(a.ts/86400.0);
+  uint32_t day2 = floor(b.ts/86400.0);
+  if(speed > b.limit) {
+    if(hmget(car->tickets, day1) || hmget(car->tickets, day2)) {
+      dbg("  ALREADY SENT for ticket to %s for day: %d - %d", plate, day1, day2);
+    } else {
+      dbg("  SENDING TICKET to %s for day: %d - %d", plate, day1, day2);
+      hmput(car->tickets, day1, true);
+      hmput(car->tickets, day2, true);
+      Ticket t = (Ticket) {
+        .plate = plate,
+        .road = a.road,
+        .mile1 = a.mile,
+        .ts1 = a.ts,
+        .mile2 = b.mile,
+        .ts2 = b.ts,
+        .speed = speed
+      };
+      arrput(state->tickets, t);
+
+      //send_ticket(state, car, a.road, a.mile, a.ts, b.mile, b.ts, speed);
+    }
+
+
+  }
 }
 
 void add_car_position(SpeedDaemon *state, char *plate, CarPos car_pos) {
   locking(state) {
-    unsigned long h = hash((uint8_t*)plate, strlen(plate));
-    CarArray *bucket = &state->bucket[h%HT_SIZE];
-    Car *car;
-    for(int i=0; i<bucket->size; i++) {
-      dbg(" bucket i=%d, plate: %s, compare to: %s", i, bucket->items[i].plate, plate);
-      if(strcmp(bucket->items[i].plate, plate)==0) {
-        car = &bucket->items[i];
-        goto found;
-      }
+
+    CarMap *cm = shgetp_null(state->car_table, plate);
+    if(cm == NULL) {
+      shput(state->car_table, plate, (Car){});
+      cm = shgetp_null(state->car_table, plate);
     }
-    da_append(bucket, ((Car) {.plate = arena_str(&state->a, plate),
-                              .observations={0}}));
-    car = da_lastptr(Car, bucket);
-  found:
-    da_append(&car->observations, car_pos);
+    assert(cm != NULL);
+    Car *car = &cm->value;
+
+    arrput(car->observations, car_pos);
+
     // debug
-    dbg("Car with plate %s has following observations (%d): ", plate, car->observations.size);
-    qsort(car->observations.items, car->observations.size, sizeof(CarPos), compare_road_and_ts);
-    da_foreach(CarPos, obs, &car->observations, {
-        dbg(" at time %d :: road: %d, mile: %d, limit: %d", obs.ts, obs.road, obs.mile, obs.limit);
-      });
+    dbg("Car with plate %s has following observations (%ld): ", plate, arrlen(car->observations));
+    qsort(car->observations, arrlen(car->observations), sizeof(CarPos), compare_road_and_ts);
+    for(int i=0;i<arrlen(car->observations);i++) {
+      CarPos obs = car->observations[i];
+      dbg(" at time %d :: road: %d, mile: %d, limit: %d", obs.ts, obs.road, obs.mile, obs.limit);
+    }
 
     // Check for tickets
-    int road = -1, mile = -1;
-    long ts = -1;
-    da_foreach(CarPos, p, &car->observations, {
-        // consecutive observations on the same road, check speed
-        if(road == p.road) {
-          long speed = round(3600.0 * abs(p.mile-mile) / (p.ts-ts));
-          dbg("  road: %d, mile: %d ==> SPEED: %ld %s", road, p.mile, speed, speed > p.limit ? "TICKET!" : "");
-          // send ticket to dispatcher
-          send_ticket(state, plate, road, mile, ts, p.mile, p.ts, speed);
+    // we need to check between any 2 observations on the same road
+    int road = -1, i=0, start_idx = 0;
+    for(i=0;i<arrlen(car->observations); i++) {
+      CarPos p = car->observations[i];
+      //dbg("  i: %d, road: %d, start_idx : %d", i, p.road, start_idx);
+      if(p.road != road) {
+        if(i-start_idx > 0) {
+          dbg("checking tickets for road: %d", p.road);
+          // have 2 or more observations, check for tickets
+          for(int j=start_idx; j<i; j++) {
+            for(int k=j+1; k<i; k++) {
+              CarPos a = car->observations[j];
+              CarPos b = car->observations[k];
+              maybe_send_ticket(state, car, cm->key, a, b);
+            }
+          }
         }
         road = p.road;
-        mile = p.mile;
-        ts = p.ts;
+        start_idx = i;
+      }
+    }
 
-      });
+    // last batch
+    if(start_idx < arrlen(car->observations)-1) {
+      dbg("checking tickets for road: %d, start_idx=%d", car->observations[start_idx].road, start_idx);
+      for(int j=start_idx; j<arrlen(car->observations); j++) {
+        for(int k=j+1; k<arrlen(car->observations); k++) {
+          dbg(" compare obs %d with %d", j,k);
+          CarPos a = car->observations[j];
+          CarPos b = car->observations[k];
+          maybe_send_ticket(state, car, cm->key, a, b);
+        }
+      }
+    }
+
   }
 }
 
 void add_dispatcher(SpeedDaemon *state, Dispatcher dispatcher) {
-  da_append(&state->dispatchers, dispatcher);
+  locking(state) {
+    arrput(state->dispatchers, dispatcher);
+  }
+}
+
+void remove_dispatcher(SpeedDaemon *state, Dispatcher dispatcher) {
+  locking(state) {
+    for(int i=0;i<arrlen(state->dispatchers);i++) {
+      if(state->dispatchers[i].socket == dispatcher.socket) {
+        arrdelswap(state->dispatchers, i);
+        break;
+      }
+    }
+  }
 }
 
 #define READ(type, to)                                                         \
@@ -237,7 +284,60 @@ void add_dispatcher(SpeedDaemon *state, Dispatcher dispatcher) {
 
 
 
+// Ticket sender thread
+void ticket_sender(SpeedDaemon *state) {
+  // poll for new tickets
+  while(1) {
+    usleep(1000);
+    locking(state) {
+      int pending_tickets = arrlen(state->tickets);
+      if(pending_tickets) {
+        dbg("Pending tickets: %d", pending_tickets);
+        Ticket t = state->tickets[0];
 
+        Dispatcher to;
+        bool found=false;
+        dbg("Sending ticket, dispatchers: %ld", arrlen(state->dispatchers));
+        for(int i=0; i<arrlen(state->dispatchers);i++) {
+          Dispatcher d = state->dispatchers[i];
+          for(int r=0;r<d.numroads;r++) {
+            if(d.roads[r] == t.road) {
+              dbg("Sending to dispatcher %d (socket %d, road %d)", i, d.socket, t.road);
+              to = d;
+              found = true;
+            }
+          }
+        }
+        if(found) {
+          int len = strlen(t.plate);
+          char head[2] = { 0x21, len };
+          write(to.socket, &head, 2);
+          write(to.socket, t.plate, len);
+          uint16_t out = htons(t.road);
+          write(to.socket, &out, 2);
+          out = htons(t.mile1);
+          write(to.socket, &out, 2);
+          uint32_t out32 = htonl(t.ts1);
+          write(to.socket, &out32, 4);
+          out = htons(t.mile2);
+          write(to.socket, &out, 2);
+          out32 = htonl(t.ts2);
+          write(to.socket, &out32, 4);
+          out = htons(t.speed*100);
+          write(to.socket, &out, 2);
+          // remove this ticket, as we successfully sent it
+          arrdelswap(state->tickets, 0);
+        } else {
+          // PENDING: do we need to try
+          dbg("  couldn't send ticket yet, no dispatcher found!");
+          // swap this to last place
+          arrdel(state->tickets, 0);
+          arrput(state->tickets, t);
+        }
+      }
+    }
+  }
+}
 
 void speed_daemon(conn_state *c) {
   Client client = {0};
@@ -245,6 +345,7 @@ void speed_daemon(conn_state *c) {
   int heartbeat = 0; // heartbeat in ms
   long last_heartbeat = 0;
   char *error; // send error to client
+
   while(1) {
     if(heartbeat > 0) {
       long n = now();
@@ -267,6 +368,10 @@ void speed_daemon(conn_state *c) {
     READ(u8, type);
     switch(type) {
     case 0x20: { // Plate
+      if(client.type != CAMERA) {
+        error = "not a camera";
+        goto fail;
+      }
       char *plate;
       u32 ts;
       if(!read_str(&a, c, &plate)) goto fail;
@@ -290,7 +395,7 @@ void speed_daemon(conn_state *c) {
     case 0x80: { // IAmCamera
       if(client.type != UNKNOWN) {
         err("Client identified as camera, but type was already set: %d", client.type);
-        error = "No changing roles!";
+        error = "already identified";
         goto fail;
       }
       client.type = CAMERA;
@@ -307,7 +412,7 @@ void speed_daemon(conn_state *c) {
     case 0x81: { // IAmDispatcher
       if(client.type != UNKNOWN) {
         err("Client identified as dispatcher but type was already set: %d", client.type);
-        error = "No changing roles!";
+        error = "already identified";
         goto fail;
       }
       client.type = DISPATCHER;
@@ -335,24 +440,43 @@ void speed_daemon(conn_state *c) {
   }
  fail:
   if(error) {
-    uint8_t len = strlen(error);
-    char head[2] = { 0x10, len };
-    write(c->socket, &head, 2);
-    write(c->socket, error, len);
+    int len = strlen(error);
+    dbg("%d sending error: %s (%d)", c->socket, error, len);
+    uint8_t errbuf[256] = { 0x10, (uint8_t) len };
+
+    memcpy(&errbuf[2], error, len);
+    if(send(c->socket, errbuf, len+2, 0) < len+2) {
+      perror("send");
+    };
   }
 
   // remove dispatcher, if I am one
-
+  if(client.type == DISPATCHER) {
+    remove_dispatcher(&state, client.data.dispatcher);
+  }
   dbg("client done");
 }
 
 
 int main(int argc, char **argv) {
+  sh_new_strdup(state.car_table);
+
+  pthread_mutex_init(&state.lock, NULL);
+
+  pthread_t ticket_thread;
+  pthread_create(&ticket_thread, NULL, (void*)ticket_sender, &state);
+
   signal(SIGPIPE, SIG_IGN);
-  serve(.type=SERVER_THREAD_WORKERS, .threads = 200, .handler=speed_daemon);
+    serve(.type=SERVER_THREAD_WORKERS, .threads = 200, .handler=speed_daemon);
 
 
   add_car_position(&state, "FOOBAR", (CarPos) {.road=1234, .mile=8398, .limit=100, .ts=64823});
   add_car_position(&state, "FOOBAR", (CarPos) {.road=1234, .mile=8388, .limit=100, .ts=64523});
+
+  add_car_position(&state, "VTF-406", (CarPos) {.road=666, .mile=420, .limit=100, .ts=64523});
+  add_car_position(&state, "VTF-406", (CarPos) {.road=666, .mile=508, .limit=100, .ts=66623});
+
+  add_car_position(&state, "OVX-422", (CarPos) {.road=20, .mile=1, .limit=100, .ts=12345});
+  add_car_position(&state, "OVX-422", (CarPos) {.road=20, .mile=10, .limit=100, .ts=12355});
 
 }
