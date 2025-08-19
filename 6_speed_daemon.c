@@ -467,16 +467,6 @@ int main(int argc, char **argv) {
   pthread_create(&ticket_thread, NULL, (void*)ticket_sender, &state);
 
   signal(SIGPIPE, SIG_IGN);
-    serve(.type=SERVER_THREAD_WORKERS, .threads = 200, .handler=speed_daemon);
-
-
-  add_car_position(&state, "FOOBAR", (CarPos) {.road=1234, .mile=8398, .limit=100, .ts=64823});
-  add_car_position(&state, "FOOBAR", (CarPos) {.road=1234, .mile=8388, .limit=100, .ts=64523});
-
-  add_car_position(&state, "VTF-406", (CarPos) {.road=666, .mile=420, .limit=100, .ts=64523});
-  add_car_position(&state, "VTF-406", (CarPos) {.road=666, .mile=508, .limit=100, .ts=66623});
-
-  add_car_position(&state, "OVX-422", (CarPos) {.road=20, .mile=1, .limit=100, .ts=12345});
-  add_car_position(&state, "OVX-422", (CarPos) {.road=20, .mile=10, .limit=100, .ts=12355});
+  serve(.type=SERVER_THREAD_WORKERS, .threads = 200, .handler=speed_daemon);
 
 }
