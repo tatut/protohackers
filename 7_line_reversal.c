@@ -139,20 +139,17 @@ int io_getchar(IO io) {
   // wait until there are
   int ch = -1;
   locking(io->read_lock) {
-    while(!io->bytes_available) {
+    while(io->read_idx == io->received) {
       pthread_cond_wait(&io->read_available, &io->read_lock);
     }
     ch = io->rcv_buf[io->read_idx++];
-    io->bytes_available--;
+    //dbg("read char: %c", ch);
   }
   return ch;
 }
 
 void io_putchar(IO io, char ch) {
-  // if there is no space in outgoing buffer, wait
   locking(io->write_lock) {
-    while(io->write_idx > 800)
-      pthread_cond_wait(&io->write_available, &io->write_lock);
     io->snd_buf[io->write_idx++] = ch;
   }
 }
@@ -235,10 +232,10 @@ void line_reversal(dgram *dg) {
         key);
     if(s) {
       dbg("New connect received for same id: %d", key);
-      SEND(s, "/ack/%d/%d/", key, s->received_acked);
+      SEND(s, "/ack/%d/%d/", key, s->received);
       return;
     }
-    s = calloc(1, sizeof(Session) + 8192);
+    s = calloc(1, sizeof(Session) + 128000);
     if(!s) {
       err("Could not allocate new session!");
       return;
@@ -246,7 +243,7 @@ void line_reversal(dgram *dg) {
     s->from = *dg->from;
     s->socket = dg->socket;
     s->rcv_buf = (uint8_t*) s + sizeof(Session);
-    s->snd_buf = s->rcv_buf + 4096;
+    s->snd_buf = s->rcv_buf + 64000;
     s->last_msg_time = now();
 
     char filename[64];
@@ -261,7 +258,7 @@ void line_reversal(dgram *dg) {
     pthread_mutex_init(&s->write_lock, NULL);
     pthread_t tid;
     pthread_create(&tid, NULL, (void*)reverser, s);
-    SEND(s, "/ack/%d/%d/", key, s->received_acked);
+    SEND(s, "/ack/%d/%d/", key, s->received);
     hmput(sessions, key, s);
   } else if(str_eq(cmd, cstr("data"))) {
     str pos_str;
@@ -308,17 +305,20 @@ void line_reversal(dgram *dg) {
         err("Message doesn't end in '/', got: %c", rest.data[i]);
         return;
       }
-      s->received += data_len;
-      SEND(s, "/ack/%d/%d/", key, s->received);
+
 
       // wait until everything has been handled
 
-      ensure_all_handled(s);
-      memcpy(s->rcv_buf, data, data_len);
-      s->bytes_available = data_len;
-      s->read_idx = 0;
-      dbg("making %ld bytes available for app level: \"%.*s\"", data_len, (int) data_len, s->rcv_buf);
-      pthread_cond_signal(&s->read_available);
+      //ensure_all_handled(s);
+      locking(s->read_lock) {
+        memcpy(&s->rcv_buf[s->received], data, data_len);
+        s->received += data_len;
+        s->bytes_available += data_len;
+        dbg("making %ld bytes available for app level: \"%.*s\"", data_len, (int) data_len, s->rcv_buf);
+        pthread_cond_signal(&s->read_available);
+      }
+
+      SEND(s, "/ack/%d/%d/", key, s->received);
 
     }
   } else if(str_eq(cmd, cstr("ack"))) {
@@ -335,11 +335,10 @@ void line_reversal(dgram *dg) {
         dbg("Got earlier ack for pos %d (but already received higher %d), ignoring.", pos, s->sent_acked);
       } else if(pos > s->sent) {
         dbg("Got ack for more than we have sent %d (only sent %d), ignoring.", pos, s->sent);
+        SEND(s, "/close/%d/", key);
+        hmdel(sessions, key);
       } else if(s->sent == pos) {
         s->sent_acked = pos;
-        s->write_idx = 0;
-        // can write more now
-        pthread_cond_signal(&s->write_available);
       }
     }
 
@@ -355,7 +354,7 @@ void line_reversal(dgram *dg) {
 
 }
 
-#define RETRANSMISSION_TIMEOUT 1500
+#define RETRANSMISSION_TIMEOUT 3000
 // send replies for active sessions
 void sender() {
   char out[1024];
@@ -365,32 +364,19 @@ void sender() {
       uint32_t key = sessions[i].key;
       Session *s = sessions[i].value;
       locking(s->write_lock) {
-        if(s->sent_acked < s->sent) {
-          // if more than 3s without ack, resend
-          long n = now();
-          if(n - s->last_sent_time > RETRANSMISSION_TIMEOUT) {
-            dbg("NEEDS RESEND");
-            char data[1024];
-            int data_len = 0;
-            for(int i=0;i<s->write_idx; i++) {
-              if(s->snd_buf[i] == '/') {
-                data[data_len++] = '\\';
-                data[data_len++] = '/';
-              } else if(s->snd_buf[i] == '\\') {
-                data[data_len++] = '\\';
-                data[data_len++] = '\\';
-              } else {
-                data[data_len++] = s->snd_buf[i];
-              }
-            }
-            SEND(s, "/data/%d/%d/%.*s/", key, s->sent_acked, data_len, data);
-            s->last_sent_time = n;
-          }
-        } else if(s->write_idx > 0) {
-          dbg("Needs sending %d", s->write_idx);
+        long n = now();
+        if((n - s->last_msg_time) > 60000) {
+          dbg("Closing inactive session: %d", key);
+          SEND(s, "/close/%d/", key);
+          hmdel(sessions, key);
+        } else if(s->write_idx > s->sent ||
+                  (s->sent_acked < s->sent &&
+                   (n - s->last_sent_time > RETRANSMISSION_TIMEOUT))) {
+          dbg("NEEDS (RE)SEND, ack pos: %d", s->sent_acked);
           char data[1024];
           int data_len = 0;
-          for(int i=0;i<s->write_idx; i++) {
+          int i=s->sent_acked;
+          while(data_len < 900 && i < s->write_idx) {
             if(s->snd_buf[i] == '/') {
               data[data_len++] = '\\';
               data[data_len++] = '/';
@@ -400,15 +386,11 @@ void sender() {
             } else {
               data[data_len++] = s->snd_buf[i];
             }
+            i++;
           }
-
           SEND(s, "/data/%d/%d/%.*s/", key, s->sent_acked, data_len, data);
-          s->last_sent_time = now();
-          s->sent += s->write_idx;
-        } else if((now() - s->last_msg_time) > 60000) {
-          dbg("Closing inactive session: %d", key);
-          SEND(s, "/close/%d/", key);
-          hmdel(sessions, key);
+          s->last_sent_time = n;
+          s->sent = i;
         }
       }
     }
