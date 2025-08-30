@@ -74,7 +74,12 @@ bool read_until(int socket, char *to, char endch, size_t maxlen);
 
 #define VA_ARGS(...) , ##__VA_ARGS__
 #define err(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n" VA_ARGS(__VA_ARGS__))
+#ifdef DEBUG
 #define dbg(fmt, ...) fprintf(stdout, "[DEBUG] " fmt "\n" VA_ARGS(__VA_ARGS__))
+#else
+#define dbg(...)
+#endif
+
 
 #endif
 
@@ -140,7 +145,7 @@ void _serve(server s) {
   if(s.type == SERVER_THREAD_WORKERS) {
     // Start workers
     s.shutdown = ATOMIC_VAR_INIT(false);
-    s.workers = alloca(sizeof(pthread_t)*s.threads);
+    s.workers = malloc(sizeof(pthread_t)*s.threads);
     server_worker_args args = {
       .handler = s.handler,
       .data = s.data,
@@ -152,6 +157,7 @@ void _serve(server s) {
     for(int i=0; i < s.threads; i++) {
       pthread_join(s.workers[i], NULL);
     }
+    free(s.workers);
     dbg("ALL THREADS DONE");
   } else if(s.type == SERVER_SELECT) {
     // Single threaded select server
@@ -233,7 +239,10 @@ void _serve(server s) {
 
 int readch(int socket) {
   char ch;
-  if(read(socket, &ch, 1) != 1) return -1;
+  if(read(socket, &ch, 1) != 1) {
+    //perror("readch");
+    return -1;
+  }
   return ch;
 }
 

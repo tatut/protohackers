@@ -16,7 +16,7 @@ bool json_expect(char **at, char CH);
 bool json_expect_consume(char **at, char CH);
 char json_at(char **at);
 
-bool json_int(char **at, int *value);
+bool json_long(char **at, long *value);
 bool json_u16(char **at, uint16_t *value);
 bool json_u8(char **at, uint8_t *value);
 bool json_double(char **at, double *value);
@@ -41,6 +41,9 @@ bool json_string_512(char **at, char *value);
 /* skip any JSON value */
 bool json_skip(char **pos);
 
+/* JSON raw, skip any JSON value but return a copy of its raw data (allocates) */
+bool json_raw(char **pos, char **raw);
+
 #define json_field(name, parser, to)                                    \
   if (strcmp(name, _json_field) == 0) {                                 \
     if (!parser(_json_obj, to)) {                                       \
@@ -62,25 +65,27 @@ bool json_skip(char **pos);
 
 #define json_ignore_unknown_fields() if(!json_skip(_json_obj)) { panic("Failed to skip JSON value.") } else { continue; }
 
-#define json_object(in, body)                                           \
-  char **_json_obj = in;                                                \
-  char _json_field[128];                                                \
-  bool _json_first = true;                                              \
-  if(!json_expect_consume(_json_obj, '{')) return false; \
-  while(json_at(_json_obj) != '}') {                                    \
-    if(!_json_first) json_expect_consume(_json_obj, ',');               \
-    _json_first = false;                                                \
-    json_string(_json_obj, 128, _json_field); \
-    /*printf(" at key: %s\n", _json_field); */                          \
-    json_expect_consume(_json_obj, ':');                                \
-    body                                                                \
-      panic("Unhandled JSON field: %s", _json_field)                   \
-      }                                                                 \
-  json_expect_consume(_json_obj, '}');                                  \
+#define json_object(in, body)                                                  \
+  char **_json_obj = in;                                                       \
+  char _json_field[128];                                                       \
+  bool _json_first = true;                                                     \
+  if (!json_expect_consume(_json_obj, '{'))                                    \
+    return false;                                                              \
+  while (json_at(_json_obj) != '}') {                                          \
+    if (!_json_first)                                                          \
+      json_expect_consume(_json_obj, ',');                                     \
+    _json_first = false;                                                       \
+    json_string(_json_obj, 128, _json_field);                                  \
+    /*printf(" at key: %s\n", _json_field); */                                 \
+    json_expect_consume(_json_obj, ':');                                       \
+    body panic("Unhandled JSON field: %s", _json_field)                        \
+  }                                                                            \
+  json_expect_consume(_json_obj, '}');                                         \
   in = _json_obj;
 
-#define json_array(in, to, type, parser)                                       \
-  char **_json_arr = in;                                                        \
+
+#define json_array(in, type, parser)                                           \
+  char **_json_arr = in;                                                       \
   bool _json_first = true;                                                     \
   json_expect_consume(_json_arr, '[');                                         \
   while (json_at(_json_arr) != ']') {                                          \
@@ -88,12 +93,18 @@ bool json_skip(char **pos);
       json_expect_consume(_json_arr, ',');                                     \
     _json_first = false;                                                       \
     type _json_arr_val;                                                        \
-    if (!parser(_json_arr, &_json_arr_val))                                    \
-      panic("Can't parse array value of type: %s", #type);                  \
-    arr_append(to, _json_arr_val);                                             \
+    if (!parser(_json_arr, &_json_arr_val)) {                                  \
+      panic("Can't parse array value of type: %s", #type);                     \
+    }                                                                          \
+    json_array_append(_json_arr_val);                                          \
   }                                                                            \
   json_expect_consume(_json_arr, ']');                                         \
   in = _json_arr;
+
+
+
+
+
 
 #endif
 
@@ -413,6 +424,36 @@ bool json_skip(char **pos) {
       return true;
     }
     return false;
+  }
+  return false;
+}
+
+bool json_raw(char **pos, char **raw) {
+  skipws(pos);
+  char *start = *pos;
+  if(json_skip(pos)) {
+    size_t size = *pos - start + 1;
+    char *data = malloc(size);
+    if(!data) {
+      panic("Couldn't allocate %ld bytes of memory for raw JSON object.", size);
+    }
+    memcpy(data, start, size-1);
+    data[size-1] = 0;
+    *raw = data;
+    return true;
+  }
+  return false;
+}
+
+bool json_bool(char **pos, bool *b) {
+  if(looking_at(*pos, "true") && !is_alphanumeric((*pos)[4])) {
+    *b = true;
+    *pos = *pos + 4;
+    return true;
+  } else if(looking_at(*pos, "false") && !is_alphanumeric((*pos)[5])) {
+    *b = false;
+    *pos = *pos + 5;
+    return true;
   }
   return false;
 }
